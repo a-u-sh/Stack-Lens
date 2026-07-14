@@ -8,9 +8,16 @@ Interaction:
 - Click a node  → emits ``function_clicked(name)`` → main window jumps to it.
 - Ctrl+scroll   → zoom anchored to mouse cursor.
 - "Fit" button  → reset zoom to show all nodes.
+
+Rendering: every node box and every edge is drawn in a single paint() call on
+one batched _CallGraphLayer item (mirroring flame_item.py's approach), instead
+of one QGraphicsObject per node plus two QGraphicsItems per edge. Click/hover
+hit-testing is done manually (row/x-range lookup) since there are no
+per-node QGraphicsItems left for Qt to dispatch events to.
 """
 
 import math
+from bisect import bisect_right
 
 from PySide6 import QtCore, QtGui, QtWidgets
 
@@ -82,96 +89,10 @@ def _assign_positions(node: dict, cx: float, row: int, positions: dict, path: st
         child_cx += w / 2 + 0.4
 
 
-# ═══════════════════════════════════════════════════════════════════════
-# Graphics items
-# ═══════════════════════════════════════════════════════════════════════
-
-class _NodeItem(QtWidgets.QGraphicsObject):
-    """Clickable function box with coloured background and two label lines."""
-
-    clicked = QtCore.Signal(str)   # emits function name
-
-    def __init__(self, name: str, display_name: str, count: int,
-                 time_val: float, unit: str, color: QtGui.QColor, parent=None):
-        super().__init__(parent)
-        self._name = name
-        self._display_name = display_name
-        self._count = count
-        self._time_val = time_val
-        self._unit = unit
-        self._color = color
-        self._hovered = False
-
-        self.setAcceptHoverEvents(True)
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-
-    # Geometry
-    def boundingRect(self) -> QtCore.QRectF:
-        return QtCore.QRectF(0, 0, NODE_W, NODE_H)
-
-    def paint(self, painter: QtGui.QPainter, option, widget=None):
-        r = QtCore.QRectF(0, 0, NODE_W, NODE_H)
-
-        # Background fill
-        fill = QtGui.QColor(self._color)
-        fill.setAlpha(NODE_ALPHA + (30 if self._hovered else 0))
-        painter.fillRect(r, fill)
-
-        # Border
-        border_color = QtGui.QColor(self._color)
-        border_color.setAlpha(255)
-        pen = QtGui.QPen(border_color, 1.5 if not self._hovered else 2.0)
-        painter.setPen(pen)
-        painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
-        painter.drawRect(r.adjusted(0.5, 0.5, -0.5, -0.5))
-
-        # Line 1 — function name (elided)
-        painter.setPen(QtGui.QColor(THEME["text_white"]))
-        f1 = painter.font()
-        f1.setPointSize(9)
-        f1.setBold(True)
-        painter.setFont(f1)
-        fm1 = QtGui.QFontMetrics(f1)
-        max_w = int(NODE_W - 10)
-        elided = fm1.elidedText(self._display_name, QtCore.Qt.TextElideMode.ElideRight, max_w)
-        painter.drawText(5, int(NODE_H * 0.44), elided)
-
-        # Line 2 — count × time
-        painter.setPen(QtGui.QColor(THEME["text_secondary"]))
-        f2 = QtGui.QFont(f1)
-        f2.setBold(False)
-        f2.setPointSize(8)
-        painter.setFont(f2)
-        label2 = f"{self._count}\u00d7 \u00b7 {self._time_val:.3f} {self._unit}"
-        painter.drawText(5, int(NODE_H * 0.78), label2)
-
-    # Hover
-    def hoverEnterEvent(self, event):
-        self._hovered = True
-        self.update()
-
-    def hoverLeaveEvent(self, event):
-        self._hovered = False
-        self.update()
-
-    # Click
-    def mousePressEvent(self, event):
-        if event.button() == QtCore.Qt.MouseButton.LeftButton:
-            self.clicked.emit(self._name)
-        super().mousePressEvent(event)
-
-    # Public update
-    def set_label(self, time_val: float, unit: str):
-        self._time_val = time_val
-        self._unit = unit
-        self.update()
-
-
-def _make_edge(scene: QtWidgets.QGraphicsScene,
-               p1: QtCore.QPointF, p2: QtCore.QPointF) -> tuple:
-    """Draw a cubic Bezier edge from p1 (bottom-centre) to p2 (top-centre)
-    with a filled arrowhead at p2. Returns (edge_item, arrow_item) so the
-    caller can recolor them later without rebuilding the scene."""
+def _edge_geometry(p1: QtCore.QPointF, p2: QtCore.QPointF) -> tuple:
+    """Return (QPainterPath, QPolygonF) for a cubic Bezier edge from p1
+    (bottom-centre of the parent box) to p2 (top-centre of the child box),
+    with a filled arrowhead triangle at p2."""
     dx = 0.0
     dy = abs(p2.y() - p1.y()) * 0.5
 
@@ -182,18 +103,6 @@ def _make_edge(scene: QtWidgets.QGraphicsScene,
         p2,
     )
 
-    edge_color = QtGui.QColor(THEME["accent_primary"])
-    pen = QtGui.QPen(edge_color, EDGE_WIDTH)
-    pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
-    edge_item = QtWidgets.QGraphicsPathItem(path)
-    edge_item.setPen(pen)
-    edge_item.setZValue(-1)
-    scene.addItem(edge_item)
-
-    # Arrowhead (filled triangle)
-    angle = math.atan2(p2.y() - (p2.y() - dy * 0.3), p2.x() - (p2.x()))
-    # Direction vector of the last segment (Bezier end tangent)
-    # tangent at t=1: 3*(p3 - p2) in cubic terms; here roughly downward
     tx = p2.x() - (p2.x() - dx)
     ty = p2.y() - (p2.y() - dy)
     tang = math.atan2(ty, tx) if (tx != 0 or ty != 0) else math.pi / 2
@@ -208,13 +117,173 @@ def _make_edge(scene: QtWidgets.QGraphicsScene,
         p2.y() + hs * math.sin(tang - math.pi * 0.85),
     )
     arrow = QtGui.QPolygonF([p2, left, right])
-    arrow_item = QtWidgets.QGraphicsPolygonItem(arrow)
-    arrow_item.setPen(QtGui.QPen(edge_color, 1.0))
-    arrow_item.setBrush(edge_color)
-    arrow_item.setZValue(-1)
-    scene.addItem(arrow_item)
+    return path, arrow
 
-    return edge_item, arrow_item
+
+# ═══════════════════════════════════════════════════════════════════════
+# Batched graphics layer — one item draws every node + edge
+# ═══════════════════════════════════════════════════════════════════════
+
+class _CallGraphLayer(QtWidgets.QGraphicsObject):
+    """Draws every node box and every edge in a single paint() call.
+
+    There are no per-node QGraphicsItems, so click/hover hit-testing is done
+    manually: nodes are bucketed by row (fixed STRIDE_Y spacing) and sorted
+    by x within each row, so a click/hover position can be resolved via a
+    row lookup + bisect, mirroring flame_item.py's bisect-based culling.
+    """
+
+    clicked = QtCore.Signal(str)   # emits function name
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptHoverEvents(True)
+        self._nodes: list = []       # dicts: path, name, rect, color, count, inclusive_us
+        self._edges: list = []       # list of (p1, p2) QPointF pairs
+        self._row_index: dict = {}   # row -> (sorted x_lefts, node indices)
+        self._bounds = QtCore.QRectF()
+        self._unit_label = "us"
+        self._unit_scale = 1.0
+        self._edge_color = QtGui.QColor(THEME["accent_primary"])
+        self._hover_path = None
+
+    # ── Data ──────────────────────────────────────────────────────────
+
+    def set_data(self, nodes: list, edges: list, bounds: QtCore.QRectF,
+                 unit_label: str, unit_scale: float) -> None:
+        self.prepareGeometryChange()
+        self._nodes = nodes
+        self._edges = edges
+        self._bounds = bounds
+        self._unit_label = unit_label
+        self._unit_scale = unit_scale
+        self._hover_path = None
+        self._rebuild_row_index()
+        self.update()
+
+    def set_unit(self, unit_label: str, unit_scale: float) -> None:
+        self._unit_label = unit_label
+        self._unit_scale = unit_scale
+        self.update()
+
+    def set_edge_color(self, color: QtGui.QColor) -> None:
+        self._edge_color = color
+        self.update()
+
+    def _rebuild_row_index(self) -> None:
+        rows: dict = {}
+        for i, n in enumerate(self._nodes):
+            row = round(n["rect"].y() / STRIDE_Y)
+            rows.setdefault(row, []).append((n["rect"].x(), i))
+        index = {}
+        for row, entries in rows.items():
+            entries.sort(key=lambda e: e[0])
+            index[row] = ([e[0] for e in entries], [e[1] for e in entries])
+        self._row_index = index
+
+    def _hit_test(self, pos: QtCore.QPointF):
+        """Return the node dict under ``pos`` (item-local coords), or None."""
+        row = round(pos.y() / STRIDE_Y)
+        entry = self._row_index.get(row)
+        if not entry:
+            return None
+        xs, idxs = entry
+        i = bisect_right(xs, pos.x()) - 1
+        if i < 0:
+            return None
+        node = self._nodes[idxs[i]]
+        if node["rect"].contains(pos):
+            return node
+        return None
+
+    # ── QGraphicsItem ───────────────────────────────────────────────
+
+    def boundingRect(self) -> QtCore.QRectF:
+        return self._bounds
+
+    def paint(self, painter: QtGui.QPainter, option, widget=None):
+        exposed = option.exposedRect
+
+        # Edges first (drawn behind nodes), culled to the exposed rect.
+        # Path/arrow/bbox are precomputed once in _build_scene() (they only
+        # depend on fixed layout positions), so paint() just draws them.
+        pen = QtGui.QPen(self._edge_color, EDGE_WIDTH)
+        pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        painter.setBrush(self._edge_color)
+        for _p1, _p2, path, arrow, bbox in self._edges:
+            if not bbox.intersects(exposed):
+                continue
+            painter.setPen(pen)
+            painter.drawPath(path)
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.drawPolygon(arrow)
+
+        # Nodes. Elided labels and node colors are precomputed once in
+        # _build_scene() too — only the hover state and unit-scaled time
+        # label are inherently dynamic and computed here.
+        f1 = QtGui.QFont(painter.font())
+        f1.setPointSize(9)
+        f1.setBold(True)
+        f2 = QtGui.QFont(f1)
+        f2.setBold(False)
+        f2.setPointSize(8)
+        text_white = QtGui.QColor(THEME["text_white"])
+        text_secondary = QtGui.QColor(THEME["text_secondary"])
+        hover_path = self._hover_path
+
+        for n in self._nodes:
+            rect = n["rect"]
+            if not rect.intersects(exposed):
+                continue
+            hovered = n["path"] == hover_path
+
+            if hovered:
+                fill = QtGui.QColor(n["color"])
+                fill.setAlpha(NODE_ALPHA + 30)
+            else:
+                fill = n["fill_normal"]
+            painter.fillRect(rect, fill)
+
+            painter.setPen(QtGui.QPen(n["border_color"], 1.5 if not hovered else 2.0))
+            painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
+            painter.drawRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
+
+            painter.setPen(text_white)
+            painter.setFont(f1)
+            painter.drawText(int(rect.x()) + 5, int(rect.y() + NODE_H * 0.44), n["elided_name"])
+
+            painter.setPen(text_secondary)
+            painter.setFont(f2)
+            time_val = n["inclusive_us"] * self._unit_scale
+            label2 = f"{n['count']}× · {time_val:.3f} {self._unit_label}"
+            painter.drawText(int(rect.x()) + 5, int(rect.y() + NODE_H * 0.78), label2)
+
+    # ── Hover / click ────────────────────────────────────────────────
+
+    def hoverMoveEvent(self, event):
+        node = self._hit_test(event.pos())
+        new_hover = node["path"] if node is not None else None
+        if new_hover != self._hover_path:
+            self._hover_path = new_hover
+            self.update()
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor) if node is not None else self.unsetCursor()
+
+    def hoverLeaveEvent(self, event):
+        if self._hover_path is not None:
+            self._hover_path = None
+            self.update()
+        self.unsetCursor()
+
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            node = self._hit_test(event.pos())
+            if node is not None:
+                self.clicked.emit(node["name"])
+                event.accept()
+                return
+        # Not on a node (background/edge) — don't consume the click, so the
+        # view's ScrollHandDrag can still start a pan from here.
+        event.ignore()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -223,22 +292,21 @@ def _make_edge(scene: QtWidgets.QGraphicsScene,
 
 def _build_scene(tree: dict, color_map: dict,
                  unit_label: str, unit_scale: float) -> tuple:
-    """Build a QGraphicsScene from the aggregated call tree.
+    """Build a QGraphicsScene containing a single _CallGraphLayer covering
+    the aggregated call tree.
 
-    Returns ``(scene, node_items, edge_items)`` where ``node_items`` is a
-    list of ``(path, _NodeItem, node)`` and ``edge_items`` is a list of
-    ``(edge_path_item, arrow_item)`` so the caller can update labels /
-    recolor on unit or theme change without rebuilding the scene.
+    Returns ``(scene, layer)``.
     """
     scene = QtWidgets.QGraphicsScene()
     scene.setBackgroundBrush(QtGui.QColor(THEME["bg_base"]))
-    node_items = []
-    edge_items = []
+    layer = _CallGraphLayer()
+    scene.addItem(layer)
 
     # Skip the synthetic <root> node — iterate its children as top-level roots
     roots = list(tree["children"].values())
     if not roots:
-        return scene, node_items, edge_items
+        layer.set_data([], [], QtCore.QRectF(), unit_label, unit_scale)
+        return scene, layer
 
     # Compute layout widths
     total_width = sum(_compute_width(r) for r in roots) + (len(roots) - 1) * 0.4
@@ -253,8 +321,20 @@ def _build_scene(tree: dict, color_map: dict,
         _assign_positions(r, cx, 0, positions, r["name"])
         cx += w / 2 + 0.4
 
-    # ── Recursive item builder ──────────────────────────────────────
-    def _add_items(node: dict, path: str, parent_path: str | None):
+    nodes = []
+    edges = []
+
+    # Precompute once (not per paint() call, not even per node): the label
+    # font/metrics used for eliding node names don't depend on the node, so
+    # building them here and reusing across all nodes avoids the per-paint
+    # elidedText() cost that used to dominate _CallGraphLayer.paint().
+    label_font = QtGui.QFont()
+    label_font.setPointSize(9)
+    label_font.setBold(True)
+    label_fm = QtGui.QFontMetrics(label_font)
+    max_label_w = int(NODE_W - 10)
+
+    def _collect(node: dict, path: str, parent_path: str | None):
         pos = positions.get(path)
         if pos is None:
             return
@@ -262,47 +342,55 @@ def _build_scene(tree: dict, color_map: dict,
         name = node["name"]
         color_hex = color_map.get(name, THEME["canvas_fallback"])
         color = QtGui.QColor(color_hex)
-        time_val = node["inclusive_us"] * unit_scale
-        item = _NodeItem(
-            name=name,
-            display_name=name,
-            count=node["count"],
-            time_val=time_val,
-            unit=unit_label,
-            color=color,
-        )
-        item.setPos(pos)
-        scene.addItem(item)
-        node_items.append((path, item, node))
+        border_color = QtGui.QColor(color)
+        border_color.setAlpha(255)
+        fill_normal = QtGui.QColor(color)
+        fill_normal.setAlpha(NODE_ALPHA)
+        nodes.append({
+            "path": path,
+            "name": name,
+            "rect": QtCore.QRectF(pos.x(), pos.y(), NODE_W, NODE_H),
+            "color": color,
+            "border_color": border_color,
+            "fill_normal": fill_normal,
+            "elided_name": label_fm.elidedText(name, QtCore.Qt.TextElideMode.ElideRight, max_label_w),
+            "count": node["count"],
+            "inclusive_us": node["inclusive_us"],
+        })
 
-        # Edge from parent
         if parent_path is not None:
             parent_pos = positions.get(parent_path)
             if parent_pos is not None:
-                p1 = QtCore.QPointF(
-                    parent_pos.x() + NODE_W / 2,
-                    parent_pos.y() + NODE_H,
-                )
-                p2 = QtCore.QPointF(
-                    pos.x() + NODE_W / 2,
-                    pos.y(),
-                )
-                edge_items.append(_make_edge(scene, p1, p2))
+                p1 = QtCore.QPointF(parent_pos.x() + NODE_W / 2, parent_pos.y() + NODE_H)
+                p2 = QtCore.QPointF(pos.x() + NODE_W / 2, pos.y())
+                path_geom, arrow_geom = _edge_geometry(p1, p2)
+                bbox = QtCore.QRectF(p1, p2).normalized()
+                edges.append((p1, p2, path_geom, arrow_geom, bbox))
 
         for child in node["children"].values():
             child_path = path + "/" + child["name"]
-            _add_items(child, child_path, path)
+            _collect(child, child_path, path)
 
     for r in roots:
-        _add_items(r, r["name"], None)
+        _collect(r, r["name"], None)
 
     # Expand the scrollable scene rect so there's always breathing room at
     # every edge when the user zooms in and pans to the boundary.
     _PAD = 90
-    items_rect = scene.itemsBoundingRect()
-    scene.setSceneRect(items_rect.adjusted(-_PAD, -_PAD, _PAD, _PAD))
+    xs_lo = [n["rect"].left() for n in nodes]
+    ys_lo = [n["rect"].top() for n in nodes]
+    xs_hi = [n["rect"].right() for n in nodes]
+    ys_hi = [n["rect"].bottom() for n in nodes]
+    items_rect = QtCore.QRectF(
+        min(xs_lo), min(ys_lo),
+        max(xs_hi) - min(xs_lo), max(ys_hi) - min(ys_lo),
+    )
+    bounds = items_rect.adjusted(-_PAD, -_PAD, _PAD, _PAD)
 
-    return scene, node_items, edge_items
+    layer.set_data(nodes, edges, bounds, unit_label, unit_scale)
+    scene.setSceneRect(bounds)
+
+    return scene, layer
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -365,8 +453,7 @@ class CallGraphDock(DockBase):
 
         self._color_map = color_map
         self._spans = spans
-        self._node_items: list = []   # list of (path, _NodeItem, raw_node)
-        self._edge_items: list = []   # list of (edge_path_item, arrow_item)
+        self._layer: _CallGraphLayer | None = None
 
         container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(container)
@@ -409,48 +496,34 @@ class CallGraphDock(DockBase):
         if color_map is not None:
             self._color_map = color_map
         tree = build_call_tree(spans)
-        scene, node_items, edge_items = _build_scene(
+        scene, layer = _build_scene(
             tree, self._color_map, self._unit_label, self._unit_scale
         )
-        for _path, item, _node in node_items:
-            item.clicked.connect(self.function_clicked)
-        self._node_items = node_items
-        self._edge_items = edge_items
+        layer.clicked.connect(self.function_clicked)
+        self._layer = layer
         self._view.setScene(scene)
         if _fit:
             # Defer fit so the view has been laid out
             QtCore.QTimer.singleShot(0, self._fit_view)
 
     def refresh_theme(self):
-        """Recolor edges/background/text in place — no scene rebuild.
+        """Recolor edges/background in place — no scene rebuild.
 
         Node fill/border colors come from ``_color_map`` (per-function,
         theme-independent) so they don't need to change. Node text colors
         are read live from THEME at paint time, so a repaint is enough.
-        Only the edge color and background are theme-dependent and stored
-        on the items themselves, so those need an explicit update.
+        Only the edge color and background are theme-dependent.
         """
         super().refresh_theme()
         self._view.refresh_theme()
-
-        edge_color = QtGui.QColor(THEME["accent_primary"])
-        for edge_item, arrow_item in self._edge_items:
-            pen = edge_item.pen()
-            pen.setColor(edge_color)
-            edge_item.setPen(pen)
-            arrow_pen = arrow_item.pen()
-            arrow_pen.setColor(edge_color)
-            arrow_item.setPen(arrow_pen)
-            arrow_item.setBrush(edge_color)
-
-        for _path, item, _node in self._node_items:
-            item.update()
+        if self._layer is not None:
+            self._layer.set_edge_color(QtGui.QColor(THEME["accent_primary"]))
 
     def set_unit(self, unit_label: str, unit_scale: float):
         """Refresh node labels for a new display unit (us / ms)."""
         super().set_unit(unit_label, unit_scale)
-        for _path, item, node in self._node_items:
-            item.set_label(node["inclusive_us"] * unit_scale, unit_label)
+        if self._layer is not None:
+            self._layer.set_unit(unit_label, unit_scale)
 
     # ── Internal ────────────────────────────────────────────────────
 
