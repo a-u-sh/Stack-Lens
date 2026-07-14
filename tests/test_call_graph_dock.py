@@ -222,3 +222,71 @@ def test_hover_tracks_node_under_cursor(qapp):
 
     dock._layer.hoverLeaveEvent(_FakeHoverEvent(node["rect"].center()))
     assert dock._layer._hover_path is None
+
+
+def test_lazy_construction_does_not_build_until_ensure_built(qapp):
+    dock = CallGraphDock(list(SPANS), dict(COLOR_MAP), lazy=True)
+    assert dock._layer is None
+    assert dock._view.scene() is None
+
+    dock.ensure_built()
+
+    assert dock._layer is not None
+    assert len(dock._layer._nodes) == 3
+
+
+def test_ensure_built_is_idempotent(qapp, monkeypatch):
+    dock = CallGraphDock(list(SPANS), dict(COLOR_MAP), lazy=True)
+    calls = []
+    original = CallGraphDock.set_spans
+
+    def counting_set_spans(self, *a, **kw):
+        calls.append(1)
+        return original(self, *a, **kw)
+
+    monkeypatch.setattr(CallGraphDock, "set_spans", counting_set_spans)
+
+    dock.ensure_built()
+    dock.ensure_built()
+    dock.ensure_built()
+
+    assert len(calls) == 1
+
+
+def test_lazy_dock_set_unit_and_refresh_theme_are_safe_before_build(qapp):
+    """set_unit/refresh_theme must not crash when called before the tab
+    has ever been shown (self._layer is still None)."""
+    dock = CallGraphDock(list(SPANS), dict(COLOR_MAP), lazy=True)
+
+    dock.set_unit("ms", 0.001)  # must not raise
+    apply_theme("Light")
+    dock.refresh_theme()  # must not raise
+    apply_theme("Dark")
+
+    # Once actually built, the unit set earlier while lazy must still apply.
+    dock.ensure_built()
+    assert dock._layer._unit_label == "ms"
+    assert dock._layer._unit_scale == 0.001
+
+
+def test_refresh_or_defer_does_not_force_build_when_not_yet_shown(qapp):
+    dock = CallGraphDock(list(SPANS), dict(COLOR_MAP), lazy=True)
+
+    dock.refresh_or_defer(list(SPANS), dict(COLOR_MAP))
+
+    assert dock._layer is None  # still not built
+
+    dock.ensure_built()
+    assert dock._layer is not None
+
+
+def test_refresh_or_defer_rebuilds_immediately_once_already_built(qapp, monkeypatch):
+    dock = CallGraphDock(list(SPANS), dict(COLOR_MAP), lazy=True)
+    dock.ensure_built()
+
+    calls = []
+    monkeypatch.setattr(dock, "set_spans", lambda *a, **kw: calls.append((a, kw)))
+
+    dock.refresh_or_defer(list(SPANS), dict(COLOR_MAP))
+
+    assert len(calls) == 1

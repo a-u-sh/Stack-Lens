@@ -485,11 +485,19 @@ class ProfilerWindow(QtWidgets.QMainWindow):
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.call_tree_dock)
         self.tabifyDockWidget(self.summary_dock, self.call_tree_dock)
 
-        # Call-graph dock (bottom, tabbed with call tree)
-        self.call_graph_dock = CallGraphDock(self.spans, self.color_map, self, tree=shared_call_tree)
+        # Call-graph dock (bottom, tabbed with call tree). Built lazily --
+        # it's tabbed with call_tree_dock (only one tab visible at a time),
+        # so building ~58k nodes/edges eagerly is wasted work for any
+        # session that never opens this specific tab.
+        self.call_graph_dock = CallGraphDock(
+            self.spans, self.color_map, self, tree=shared_call_tree, lazy=True
+        )
         self.call_graph_dock.setObjectName("dock_call_graph")
         self.call_graph_dock.setTitleBarWidget(DockTitleBar(self.call_graph_dock))
         self.call_graph_dock.function_clicked.connect(self._jump_to_function_name)
+        self.call_graph_dock.visibilityChanged.connect(
+            lambda visible: self.call_graph_dock.ensure_built() if visible else None
+        )
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.call_graph_dock)
         self.tabifyDockWidget(self.call_tree_dock, self.call_graph_dock)
 
@@ -522,6 +530,17 @@ class ProfilerWindow(QtWidgets.QMainWindow):
         self.ribbon_dock.tick_clicked.connect(self._on_ribbon_tick_clicked)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.ribbon_dock)
         self.tabifyDockWidget(self.summary_dock, self.ribbon_dock)
+
+        # Explicitly pick the default active tab in this group instead of
+        # leaving it to whichever dock tabifyDockWidget() happened to raise
+        # last (which was call_graph_dock -- by far the most expensive one
+        # to build, and exactly what the lazy-construction above is trying
+        # to avoid paying for by default). marker_dock is one of the
+        # cheapest docks here *and* shows real content immediately, unlike
+        # e.g. ribbon_dock which starts as just a hint label.
+        # _restore_session()'s restoreState() below overrides this for a
+        # returning user who had a different tab active last time.
+        self.marker_dock.raise_()
 
         # Bookmark dock — starts hidden; shown via Ctrl+Shift+B or Panels menu
         self.bookmark_dock = BookmarkDock(parent=self)
@@ -1871,7 +1890,7 @@ class ProfilerWindow(QtWidgets.QMainWindow):
         shared_call_tree = build_call_tree(self.spans)
         self.summary_dock.set_spans(self.spans, self.color_map)
         self.call_tree_dock.set_spans(self.spans, self.total_us, self.color_map, tree=shared_call_tree)
-        self.call_graph_dock.set_spans(self.spans, self.color_map, tree=shared_call_tree)
+        self.call_graph_dock.refresh_or_defer(self.spans, self.color_map, tree=shared_call_tree)
         self.marker_dock.set_marks(self.marks)
         self.marker_dock.set_unit(self.unit_label, self.unit_scale)
         self.top_n_dock.set_spans(self.spans, self.color_map)
