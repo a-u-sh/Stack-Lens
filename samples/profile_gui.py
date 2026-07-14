@@ -9,6 +9,7 @@ callbacks fire, then dumps a .pstats file for viewing with snakeviz.
 import cProfile
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -31,12 +32,15 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
 
     profiler = cProfile.Profile()
+    t0 = time.perf_counter()
     profiler.enable()
     win = ProfilerWindow(spans, marks=marks, pause_regions=pause_regions, wrapped=False, cpu_mhz=96.0)
     win.show()
     for _ in range(10):
         app.processEvents()
     profiler.disable()
+    wall = time.perf_counter() - t0
+    print(f"wall time: {wall:.3f}s")
 
     win.close()
     app.quit()

@@ -168,9 +168,10 @@ class _NodeItem(QtWidgets.QGraphicsObject):
 
 
 def _make_edge(scene: QtWidgets.QGraphicsScene,
-               p1: QtCore.QPointF, p2: QtCore.QPointF) -> None:
+               p1: QtCore.QPointF, p2: QtCore.QPointF) -> tuple:
     """Draw a cubic Bezier edge from p1 (bottom-centre) to p2 (top-centre)
-    with a filled arrowhead at p2."""
+    with a filled arrowhead at p2. Returns (edge_item, arrow_item) so the
+    caller can recolor them later without rebuilding the scene."""
     dx = 0.0
     dy = abs(p2.y() - p1.y()) * 0.5
 
@@ -213,6 +214,8 @@ def _make_edge(scene: QtWidgets.QGraphicsScene,
     arrow_item.setZValue(-1)
     scene.addItem(arrow_item)
 
+    return edge_item, arrow_item
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # Scene builder
@@ -222,17 +225,20 @@ def _build_scene(tree: dict, color_map: dict,
                  unit_label: str, unit_scale: float) -> tuple:
     """Build a QGraphicsScene from the aggregated call tree.
 
-    Returns ``(scene, node_items)`` where ``node_items`` is a list of
-    ``(path, _NodeItem)`` so the caller can update labels on unit change.
+    Returns ``(scene, node_items, edge_items)`` where ``node_items`` is a
+    list of ``(path, _NodeItem, node)`` and ``edge_items`` is a list of
+    ``(edge_path_item, arrow_item)`` so the caller can update labels /
+    recolor on unit or theme change without rebuilding the scene.
     """
     scene = QtWidgets.QGraphicsScene()
     scene.setBackgroundBrush(QtGui.QColor(THEME["bg_base"]))
     node_items = []
+    edge_items = []
 
     # Skip the synthetic <root> node — iterate its children as top-level roots
     roots = list(tree["children"].values())
     if not roots:
-        return scene, node_items
+        return scene, node_items, edge_items
 
     # Compute layout widths
     total_width = sum(_compute_width(r) for r in roots) + (len(roots) - 1) * 0.4
@@ -281,7 +287,7 @@ def _build_scene(tree: dict, color_map: dict,
                     pos.x() + NODE_W / 2,
                     pos.y(),
                 )
-                _make_edge(scene, p1, p2)
+                edge_items.append(_make_edge(scene, p1, p2))
 
         for child in node["children"].values():
             child_path = path + "/" + child["name"]
@@ -296,7 +302,7 @@ def _build_scene(tree: dict, color_map: dict,
     items_rect = scene.itemsBoundingRect()
     scene.setSceneRect(items_rect.adjusted(-_PAD, -_PAD, _PAD, _PAD))
 
-    return scene, node_items
+    return scene, node_items, edge_items
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -360,6 +366,7 @@ class CallGraphDock(DockBase):
         self._color_map = color_map
         self._spans = spans
         self._node_items: list = []   # list of (path, _NodeItem, raw_node)
+        self._edge_items: list = []   # list of (edge_path_item, arrow_item)
 
         container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(container)
@@ -402,23 +409,42 @@ class CallGraphDock(DockBase):
         if color_map is not None:
             self._color_map = color_map
         tree = build_call_tree(spans)
-        scene, node_items = _build_scene(
+        scene, node_items, edge_items = _build_scene(
             tree, self._color_map, self._unit_label, self._unit_scale
         )
         for _path, item, _node in node_items:
             item.clicked.connect(self.function_clicked)
         self._node_items = node_items
+        self._edge_items = edge_items
         self._view.setScene(scene)
         if _fit:
             # Defer fit so the view has been laid out
             QtCore.QTimer.singleShot(0, self._fit_view)
 
     def refresh_theme(self):
-        """Rebuild the scene so edge/node colors pick up the new theme."""
+        """Recolor edges/background/text in place — no scene rebuild.
+
+        Node fill/border colors come from ``_color_map`` (per-function,
+        theme-independent) so they don't need to change. Node text colors
+        are read live from THEME at paint time, so a repaint is enough.
+        Only the edge color and background are theme-dependent and stored
+        on the items themselves, so those need an explicit update.
+        """
         super().refresh_theme()
         self._view.refresh_theme()
-        if self._spans:
-            self.set_spans(self._spans, _fit=False)
+
+        edge_color = QtGui.QColor(THEME["accent_primary"])
+        for edge_item, arrow_item in self._edge_items:
+            pen = edge_item.pen()
+            pen.setColor(edge_color)
+            edge_item.setPen(pen)
+            arrow_pen = arrow_item.pen()
+            arrow_pen.setColor(edge_color)
+            arrow_item.setPen(arrow_pen)
+            arrow_item.setBrush(edge_color)
+
+        for _path, item, _node in self._node_items:
+            item.update()
 
     def set_unit(self, unit_label: str, unit_scale: float):
         """Refresh node labels for a new display unit (us / ms)."""
