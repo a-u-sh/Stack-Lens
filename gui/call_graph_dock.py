@@ -455,13 +455,21 @@ class CallGraphDock(DockBase):
 
     function_clicked = QtCore.Signal(str)
 
-    def __init__(self, spans, color_map, parent=None, tree=None):
+    def __init__(self, spans, color_map, parent=None, tree=None, lazy=False):
+        """``lazy=True`` skips building the graph now (spans/tree are just
+        stashed) -- call ensure_built() to build it on first actual use.
+        This dock is tabbed with CallTreeDock (only one tab is visible at
+        a time), so building ~58k nodes/edges eagerly is wasted work for
+        any session that never opens this tab.
+        """
         super().__init__("Call Graph", parent)
         self.setAllowedAreas(QtCore.Qt.DockWidgetArea.AllDockWidgetAreas)
 
         self._color_map = color_map
         self._spans = spans
         self._layer: _CallGraphLayer | None = None
+        self._built = False
+        self._pending_tree = tree
 
         container = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(container)
@@ -494,9 +502,37 @@ class CallGraphDock(DockBase):
         fit_sc.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
         fit_sc.activated.connect(self._fit_view)
 
-        self.set_spans(spans, color_map, tree=tree)
+        if lazy:
+            self._pending_tree = tree
+        else:
+            self.set_spans(spans, color_map, tree=tree)
 
     # ── Public API ──────────────────────────────────────────────────
+
+    def ensure_built(self) -> None:
+        """Build the graph now if it hasn't been already.
+
+        Safe to call unconditionally (e.g. from a visibilityChanged
+        handler every time the tab is shown) -- a no-op once built.
+        """
+        if self._built:
+            return
+        self.set_spans(self._spans, self._color_map, tree=self._pending_tree)
+
+    def refresh_or_defer(self, spans, color_map=None, tree=None) -> None:
+        """Like set_spans(), but if this dock hasn't been built yet (its
+        tab has never been shown), just stash the new data instead of
+        forcing a build. Meant for callers like a live-refresh/reload path
+        that shouldn't undo the laziness by rebuilding a tab nobody has
+        looked at yet on every refresh.
+        """
+        if self._built:
+            self.set_spans(spans, color_map, tree=tree)
+        else:
+            self._spans = spans
+            if color_map is not None:
+                self._color_map = color_map
+            self._pending_tree = tree
 
     def set_spans(self, spans, color_map=None, _fit=True, tree=None):
         """Rebuild the graph from a new span list.
@@ -507,7 +543,13 @@ class CallGraphDock(DockBase):
         ever read here -- _build_scene()'s layout pass keeps its own
         per-node width data in a side dict rather than writing onto the
         tree, so it's safe to share the same tree object with other docks.
+
+        Calling this (from anywhere) always builds immediately, even if
+        the dock was constructed with lazy=True and never actually shown
+        -- an explicit rebuild request (e.g. a new trace loaded) should
+        never be silently skipped.
         """
+        self._built = True
         self._spans = spans
         if color_map is not None:
             self._color_map = color_map
