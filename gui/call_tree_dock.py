@@ -144,7 +144,6 @@ class CallTreeDock(DockBase):
         finally:
             self._suppress_expand_resize = False
             self._tree.setSortingEnabled(True)
-        self._resize_columns()
 
     def set_unit(self, unit_label, unit_scale):
         """Switch display unit between 'us' and 'ms'."""
