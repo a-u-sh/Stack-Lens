@@ -205,29 +205,28 @@ class _CallGraphLayer(QtWidgets.QGraphicsObject):
         exposed = option.exposedRect
 
         # Edges first (drawn behind nodes), culled to the exposed rect.
+        # Path/arrow/bbox are precomputed once in _build_scene() (they only
+        # depend on fixed layout positions), so paint() just draws them.
         pen = QtGui.QPen(self._edge_color, EDGE_WIDTH)
         pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
-        painter.setPen(pen)
         painter.setBrush(self._edge_color)
-        for p1, p2 in self._edges:
-            edge_bbox = QtCore.QRectF(p1, p2).normalized()
-            if not edge_bbox.intersects(exposed):
+        for _p1, _p2, path, arrow, bbox in self._edges:
+            if not bbox.intersects(exposed):
                 continue
-            path, arrow = _edge_geometry(p1, p2)
             painter.setPen(pen)
             painter.drawPath(path)
             painter.setPen(QtCore.Qt.PenStyle.NoPen)
             painter.drawPolygon(arrow)
 
-        # Nodes.
+        # Nodes. Elided labels and node colors are precomputed once in
+        # _build_scene() too — only the hover state and unit-scaled time
+        # label are inherently dynamic and computed here.
         f1 = QtGui.QFont(painter.font())
         f1.setPointSize(9)
         f1.setBold(True)
-        fm1 = QtGui.QFontMetrics(f1)
         f2 = QtGui.QFont(f1)
         f2.setBold(False)
         f2.setPointSize(8)
-        max_w = int(NODE_W - 10)
         text_white = QtGui.QColor(THEME["text_white"])
         text_secondary = QtGui.QColor(THEME["text_secondary"])
         hover_path = self._hover_path
@@ -238,20 +237,20 @@ class _CallGraphLayer(QtWidgets.QGraphicsObject):
                 continue
             hovered = n["path"] == hover_path
 
-            fill = QtGui.QColor(n["color"])
-            fill.setAlpha(NODE_ALPHA + (30 if hovered else 0))
+            if hovered:
+                fill = QtGui.QColor(n["color"])
+                fill.setAlpha(NODE_ALPHA + 30)
+            else:
+                fill = n["fill_normal"]
             painter.fillRect(rect, fill)
 
-            border_color = QtGui.QColor(n["color"])
-            border_color.setAlpha(255)
-            painter.setPen(QtGui.QPen(border_color, 1.5 if not hovered else 2.0))
+            painter.setPen(QtGui.QPen(n["border_color"], 1.5 if not hovered else 2.0))
             painter.setBrush(QtCore.Qt.BrushStyle.NoBrush)
             painter.drawRect(rect.adjusted(0.5, 0.5, -0.5, -0.5))
 
             painter.setPen(text_white)
             painter.setFont(f1)
-            elided = fm1.elidedText(n["name"], QtCore.Qt.TextElideMode.ElideRight, max_w)
-            painter.drawText(int(rect.x()) + 5, int(rect.y() + NODE_H * 0.44), elided)
+            painter.drawText(int(rect.x()) + 5, int(rect.y() + NODE_H * 0.44), n["elided_name"])
 
             painter.setPen(text_secondary)
             painter.setFont(f2)
@@ -325,6 +324,16 @@ def _build_scene(tree: dict, color_map: dict,
     nodes = []
     edges = []
 
+    # Precompute once (not per paint() call, not even per node): the label
+    # font/metrics used for eliding node names don't depend on the node, so
+    # building them here and reusing across all nodes avoids the per-paint
+    # elidedText() cost that used to dominate _CallGraphLayer.paint().
+    label_font = QtGui.QFont()
+    label_font.setPointSize(9)
+    label_font.setBold(True)
+    label_fm = QtGui.QFontMetrics(label_font)
+    max_label_w = int(NODE_W - 10)
+
     def _collect(node: dict, path: str, parent_path: str | None):
         pos = positions.get(path)
         if pos is None:
@@ -332,11 +341,19 @@ def _build_scene(tree: dict, color_map: dict,
 
         name = node["name"]
         color_hex = color_map.get(name, THEME["canvas_fallback"])
+        color = QtGui.QColor(color_hex)
+        border_color = QtGui.QColor(color)
+        border_color.setAlpha(255)
+        fill_normal = QtGui.QColor(color)
+        fill_normal.setAlpha(NODE_ALPHA)
         nodes.append({
             "path": path,
             "name": name,
             "rect": QtCore.QRectF(pos.x(), pos.y(), NODE_W, NODE_H),
-            "color": QtGui.QColor(color_hex),
+            "color": color,
+            "border_color": border_color,
+            "fill_normal": fill_normal,
+            "elided_name": label_fm.elidedText(name, QtCore.Qt.TextElideMode.ElideRight, max_label_w),
             "count": node["count"],
             "inclusive_us": node["inclusive_us"],
         })
@@ -346,7 +363,9 @@ def _build_scene(tree: dict, color_map: dict,
             if parent_pos is not None:
                 p1 = QtCore.QPointF(parent_pos.x() + NODE_W / 2, parent_pos.y() + NODE_H)
                 p2 = QtCore.QPointF(pos.x() + NODE_W / 2, pos.y())
-                edges.append((p1, p2))
+                path_geom, arrow_geom = _edge_geometry(p1, p2)
+                bbox = QtCore.QRectF(p1, p2).normalized()
+                edges.append((p1, p2, path_geom, arrow_geom, bbox))
 
         for child in node["children"].values():
             child_path = path + "/" + child["name"]

@@ -81,6 +81,30 @@ def test_set_spans_builds_expected_node_and_edge_counts(qapp):
     assert len(dock._layer._edges) == 2  # main->foo, main->bar
 
 
+def test_node_paint_data_is_precomputed_not_recomputed_per_paint(qapp):
+    """Elided labels and node colors are computed once in _build_scene(),
+    not on every paint() call — this is the whole point of the fix."""
+    dock = _make_dock(qapp)
+    for n in dock._layer._nodes:
+        # Short test names fit well within the node width, so elision
+        # should be a no-op -- this also catches an elision computed
+        # against the wrong font/width silently mangling short names.
+        assert n["elided_name"] == n["name"]
+        assert isinstance(n["border_color"], QtGui.QColor)
+        assert isinstance(n["fill_normal"], QtGui.QColor)
+        assert n["border_color"].alpha() == 255
+        assert n["fill_normal"].alpha() == 160  # NODE_ALPHA
+
+
+def test_edge_geometry_is_precomputed(qapp):
+    dock = _make_dock(qapp)
+    for p1, p2, path, arrow, bbox in dock._layer._edges:
+        assert isinstance(path, QtGui.QPainterPath)
+        assert isinstance(arrow, QtGui.QPolygonF)
+        assert bbox.contains(p1)
+        assert bbox.contains(p2)
+
+
 def test_refresh_theme_does_not_rebuild_scene(qapp):
     dock = _make_dock(qapp)
     scene_before = dock._view.scene()
