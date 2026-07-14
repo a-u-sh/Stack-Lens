@@ -14,6 +14,13 @@ dependencies = [
     "pyelftools>=0.29",
 ]
 
+[project.optional-dependencies]
+profiling = [
+    "snakeviz>=2.2",
+    "py-spy>=0.4",     # sampling profiler; on Windows must be run from an elevated (Administrator) terminal
+    "viztracer>=1.1",  # in-process tracing profiler; no elevation needed, works well for the GUI
+]
+
 [project.scripts]
 cortexm0-profiler = "profiler:main"
 
