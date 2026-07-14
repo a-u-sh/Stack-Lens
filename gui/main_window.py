@@ -73,7 +73,6 @@ class ProfilerWindow(QtWidgets.QMainWindow):
 
         # Color map per function name — preserved across refreshes so colors stay stable
         self.color_map = {}
-        self._update_color_map()
 
         # Display unit: "us" → 1.0, "ms" → 0.001. Default to ms.
         self.unit_label = "ms"
@@ -115,13 +114,28 @@ class ProfilerWindow(QtWidgets.QMainWindow):
         # Color mode
         self._color_mode = "function"
 
-        # Chart display settings (defaults; overridden by _restore_session)
+        # Chart display settings (defaults; overridden below / by _restore_session)
         self._row_height_setting: float = 0.85
         self._font_size_setting:  int   = 8
         self._palette_name:       str   = "Default"
         self._ts_decimals:        int   = 3
         self._bookmark_snap:      bool  = False
         self._exclude_isr_time:   bool  = False
+
+        # Apply persisted theme/palette *before* building anything, so the
+        # UI is constructed once with the user's actual settings instead of
+        # being built with hardcoded defaults and then immediately rebuilt.
+        # (Widget-dependent restores — dock geometry, view toggles, etc. —
+        # still happen post-build in _restore_session().)
+        s = self._load_settings()
+        saved_theme = s.get("theme", "Dark")
+        if saved_theme in THEMES:
+            apply_theme(saved_theme)
+        self._palette_name = s.get("palette", "Default")
+        if self._palette_name != "Default":
+            self.color_map = self._compute_palette_color_map(self._palette_name)
+        else:
+            self._update_color_map()
 
         self._build_ui()
         self._toast = ToastWidget(self)
@@ -142,12 +156,9 @@ class ProfilerWindow(QtWidgets.QMainWindow):
         # and some child widgets consume +/- too).
         self._install_pan_zoom_shortcuts()
 
-        # Restore session state (theme first, then unit/docks/visibility)
-        s = self._load_settings()
-        saved_theme = s.get("theme", "Dark")
-        if saved_theme in THEMES and saved_theme != "Dark":
-            self._on_theme_changed(saved_theme)
-        self._restore_session()
+        # Restore remaining session state (unit/docks/visibility). Theme and
+        # palette were already applied above, before the UI was built.
+        self._restore_session(s)
 
         from .file_association import register_sltrace_association as _reg
         _reg(os.path.join(os.path.dirname(__file__), "icons", "icon.ico"))
@@ -218,6 +229,22 @@ class ProfilerWindow(QtWidgets.QMainWindow):
                         break
                 else:
                     self.color_map[name] = COLORS[i % len(COLORS)]
+
+    def _compute_palette_color_map(self, palette_name: str) -> dict:
+        """Assign every known function a stable color from the named palette."""
+        palette_colors = PALETTES.get(palette_name, COLORS)
+        color_map: dict = {}
+        used: set[str] = set()
+        for i, name in enumerate(self.func_names):
+            for j in range(len(palette_colors)):
+                candidate = palette_colors[(i + j) % len(palette_colors)]
+                if candidate not in used:
+                    color_map[name] = candidate
+                    used.add(candidate)
+                    break
+            else:
+                color_map[name] = palette_colors[i % len(palette_colors)]
+        return color_map
 
     # ── UI construction ──────────────────────────────────────────────
 
@@ -542,10 +569,17 @@ class ProfilerWindow(QtWidgets.QMainWindow):
         except Exception:
             pass
 
-    def _restore_session(self) -> None:
-        """Apply all persisted session state after the UI is fully built."""
+    def _restore_session(self, s: dict | None = None) -> None:
+        """Apply persisted session state that needs the UI already built
+        (dock geometry, view toggles, etc).
+
+        Theme and palette are handled earlier, in __init__, before the UI
+        is constructed — see _compute_palette_color_map() — so they are
+        not touched here.
+        """
         import base64
-        s = self._load_settings()
+        if s is None:
+            s = self._load_settings()
 
         # Display unit
         saved_unit = s.get("unit", "ms")
@@ -558,7 +592,6 @@ class ProfilerWindow(QtWidgets.QMainWindow):
             self._set_color_mode(saved_mode)
 
         # Chart display settings
-        self._palette_name       = s.get("palette",       "Default")
         self._row_height_setting = float(s.get("row_height",    0.85))
         self._font_size_setting  = int(s.get("font_size",     8))
         self._ts_decimals        = int(s.get("ts_decimals",   3))
@@ -566,21 +599,6 @@ class ProfilerWindow(QtWidgets.QMainWindow):
         # Apply timestamp decimals to toolbar spinboxes immediately
         self.window_spin.setDecimals(self._ts_decimals)
         self.jump_spin.setDecimals(self._ts_decimals)
-        # Rebuild color map with saved palette if it differs from default
-        if self._palette_name != "Default":
-            palette_colors = PALETTES.get(self._palette_name, COLORS)
-            self.color_map.clear()
-            used: set[str] = set()
-            for i, name in enumerate(self.func_names):
-                for j in range(len(palette_colors)):
-                    candidate = palette_colors[(i + j) % len(palette_colors)]
-                    if candidate not in used:
-                        self.color_map[name] = candidate
-                        used.add(candidate)
-                        break
-                else:
-                    self.color_map[name] = palette_colors[i % len(palette_colors)]
-            self._populate_plot()
 
         # Dock geometry — restoreState needs all docks already added to the window
         dock_state_b64 = s.get("dock_state")
