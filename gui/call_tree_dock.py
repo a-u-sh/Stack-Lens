@@ -14,6 +14,12 @@ _ROLE_EXCLUSIVE_US = QtCore.Qt.ItemDataRole.UserRole + 2
 # Numeric-sort key for columns whose display text is a formatted string
 # (e.g. "1.234" or "12.3%") but we want to sort by the raw float value.
 _ROLE_NUMERIC_SORT = QtCore.Qt.ItemDataRole.UserRole + 3
+# Raw aggregated-tree node dict, stashed on any item whose children haven't
+# been materialized yet, so _on_item_expanded() can build them on demand.
+_ROLE_NODE_DATA = QtCore.Qt.ItemDataRole.UserRole + 4
+# Marks the single dummy child added (so Qt draws an expand arrow) on any
+# item whose real children haven't been built yet.
+_ROLE_IS_PLACEHOLDER = QtCore.Qt.ItemDataRole.UserRole + 5
 
 
 class _SortableTreeItem(QtWidgets.QTreeWidgetItem):
@@ -46,6 +52,12 @@ class CallTreeDock(DockBase):
     Self %    = exclusive / total-run-time
     Total %   = inclusive / total-run-time
 
+    A node's children are only materialized into real QTreeWidgetItems the
+    first time it's expanded (lazy population) — until then it carries a
+    single placeholder child just so Qt draws an expand arrow. This avoids
+    building the entire tree (which can be tens of thousands of items for a
+    busy trace) when most of it will never be looked at.
+
     Signals:
         function_clicked(name) — user clicked a row
     """
@@ -58,6 +70,10 @@ class CallTreeDock(DockBase):
 
         self._color_map = color_map
         self._total_us = max(total_us, 1e-9)
+        # True while set_spans()'s bulk auto-expand-first-level loop runs, so
+        # _on_item_expanded() doesn't do an O(tree size) column resize once
+        # per top-level item (that turned one resize pass into thousands).
+        self._suppress_expand_resize = False
 
         self._tree = QtWidgets.QTreeWidget()
         self._tree.setColumnCount(6)
@@ -85,6 +101,7 @@ class CallTreeDock(DockBase):
         self._tree.itemClicked.connect(
             lambda item, col: self.function_clicked.emit(item.text(0))
         )
+        self._tree.itemExpanded.connect(self._on_item_expanded)
         self.setWidget(self._tree)
 
         self._apply_headers()
@@ -98,9 +115,14 @@ class CallTreeDock(DockBase):
             self._color_map = color_map
         self._total_us = max(total_us, 1e-9)
 
-        # Disable sorting during populate — otherwise each addChild
-        # triggers a re-sort mid-populate.
+        # Disable sorting during populate — otherwise each addChild triggers
+        # a re-sort mid-populate. This must stay off through the whole bulk
+        # pass, including the auto-expand-first-level loop below (which
+        # lazily populates level-1 children via _on_item_expanded) — that
+        # loop can touch thousands of items, and re-sorting per addChild
+        # there is exactly the O(n log n)-per-node blowup this avoids.
         self._tree.setSortingEnabled(False)
+        self._suppress_expand_resize = True
         try:
             self._tree.clear()
             root = build_call_tree(spans)
@@ -113,19 +135,16 @@ class CallTreeDock(DockBase):
             for child in top_children:
                 self._tree.addTopLevelItem(self._make_item(child))
 
-            # resizeColumnToContents ignores QSS padding, sort-indicator
-            # space, and bold font metrics widening, so unconditionally
-            # add 36 px of headroom per column (matches the helper used
-            # for QTableWidget docks).
-            for col in range(6):
-                self._tree.resizeColumnToContents(col)
-                self._tree.setColumnWidth(col, self._tree.columnWidth(col) + 36)
-        finally:
-            self._tree.setSortingEnabled(True)
+            # Expand the first level by default (lazily materializes each
+            # top-level item's own real children).
+            for i in range(self._tree.topLevelItemCount()):
+                self._tree.topLevelItem(i).setExpanded(True)
 
-        # Expand the first level by default
-        for i in range(self._tree.topLevelItemCount()):
-            self._tree.topLevelItem(i).setExpanded(True)
+            self._resize_columns()
+        finally:
+            self._suppress_expand_resize = False
+            self._tree.setSortingEnabled(True)
+        self._resize_columns()
 
     def set_unit(self, unit_label, unit_scale):
         """Switch display unit between 'us' and 'ms'."""
@@ -133,7 +152,9 @@ class CallTreeDock(DockBase):
         self._tree.setSortingEnabled(False)
         try:
             self._apply_headers()
-            # Walk all items and update their time-column text
+            # Walk currently-materialized items and update their time-column
+            # text. Not-yet-populated (lazy) subtrees don't need fixing up —
+            # _make_item() reads the (now-updated) unit when they're built.
             for i in range(self._tree.topLevelItemCount()):
                 self._update_item_text(self._tree.topLevelItem(i))
         finally:
@@ -158,7 +179,21 @@ class CallTreeDock(DockBase):
         for col, tip in enumerate(tooltips):
             header.setToolTip(col, tip)
 
+    def _resize_columns(self):
+        # resizeColumnToContents ignores QSS padding, sort-indicator space,
+        # and bold font metrics widening, so unconditionally add 36px of
+        # headroom per column (matches the helper used for QTableWidget
+        # docks). Re-run whenever new (previously-lazy) rows are populated
+        # so columns keep growing to fit content the user has expanded into.
+        for col in range(6):
+            self._tree.resizeColumnToContents(col)
+            self._tree.setColumnWidth(col, self._tree.columnWidth(col) + 36)
+
     def _make_item(self, node):
+        """Build one row for `node`. Real grandchildren are NOT built here —
+        if `node` has children, a single placeholder child is added instead
+        (so Qt shows an expand arrow) and the raw node is stashed for
+        _on_item_expanded() to materialize them lazily on first expand."""
         total_pct = 100.0 * node["inclusive_us"] / self._total_us
         self_pct = 100.0 * node["exclusive_us"] / self._total_us
 
@@ -195,13 +230,34 @@ class CallTreeDock(DockBase):
                 QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter,
             )
 
-        for child in sorted(node["children"].values(), key=lambda n: n["inclusive_us"], reverse=True):
-            item.addChild(self._make_item(child))
+        if node["children"]:
+            item.setData(0, _ROLE_NODE_DATA, node)
+            placeholder = QtWidgets.QTreeWidgetItem([""])
+            placeholder.setData(0, _ROLE_IS_PLACEHOLDER, True)
+            item.addChild(placeholder)
 
         return item
 
+    def _on_item_expanded(self, item):
+        """Materialize an item's real children the first time it's expanded."""
+        if item.childCount() != 1:
+            return
+        placeholder = item.child(0)
+        if not placeholder.data(0, _ROLE_IS_PLACEHOLDER):
+            return  # already populated (or a genuine single leaf child)
+
+        node = item.data(0, _ROLE_NODE_DATA)
+        item.takeChild(0)  # drop the placeholder
+        for child in sorted(node["children"].values(), key=lambda n: n["inclusive_us"], reverse=True):
+            item.addChild(self._make_item(child))
+        if not self._suppress_expand_resize:
+            self._resize_columns()
+
     def _update_item_text(self, item):
-        """Recursively re-render the time columns using the current unit scale."""
+        """Recursively re-render the time columns of already-materialized
+        items using the current unit scale. Skips placeholder children."""
+        if item.data(0, _ROLE_IS_PLACEHOLDER):
+            return
         inc = item.data(2, _ROLE_INCLUSIVE_US)
         exc = item.data(3, _ROLE_EXCLUSIVE_US)
         if inc is not None:
