@@ -11,6 +11,7 @@ _RECENT_MAX = 8
 import pyqtgraph as pg
 from PySide6 import QtCore, QtGui, QtWidgets
 
+from span_builder import build_call_tree
 from trace_io import export_csv, export_json, export_sltrace
 
 from .axes import DepthAxis, UnitAxis
@@ -466,8 +467,18 @@ class ProfilerWindow(QtWidgets.QMainWindow):
         self.summary_dock.cursor_snap_requested.connect(self._snap_cursor_to_function)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.summary_dock)
 
+        # Call-tree and call-graph docks both aggregate the same spans into
+        # the same tree shape (build_call_tree) -- compute it once and share
+        # it between them instead of each dock recomputing it independently.
+        # Neither dock mutates the tree (CallGraphDock's layout pass keeps
+        # its own per-node width data in a side dict), so sharing the same
+        # object is safe.
+        shared_call_tree = build_call_tree(self.spans)
+
         # Call-tree dock (bottom, tabbed with summary)
-        self.call_tree_dock = CallTreeDock(self.spans, self.color_map, self.total_us, self)
+        self.call_tree_dock = CallTreeDock(
+            self.spans, self.color_map, self.total_us, self, tree=shared_call_tree
+        )
         self.call_tree_dock.setObjectName("dock_call_tree")
         self.call_tree_dock.setTitleBarWidget(DockTitleBar(self.call_tree_dock))
         self.call_tree_dock.function_clicked.connect(self._jump_to_function_name)
@@ -475,7 +486,7 @@ class ProfilerWindow(QtWidgets.QMainWindow):
         self.tabifyDockWidget(self.summary_dock, self.call_tree_dock)
 
         # Call-graph dock (bottom, tabbed with call tree)
-        self.call_graph_dock = CallGraphDock(self.spans, self.color_map, self)
+        self.call_graph_dock = CallGraphDock(self.spans, self.color_map, self, tree=shared_call_tree)
         self.call_graph_dock.setObjectName("dock_call_graph")
         self.call_graph_dock.setTitleBarWidget(DockTitleBar(self.call_graph_dock))
         self.call_graph_dock.function_clicked.connect(self._jump_to_function_name)
@@ -1854,10 +1865,13 @@ class ProfilerWindow(QtWidgets.QMainWindow):
         self.search_combo.blockSignals(False)
         self._update_search_completer()
 
-        # Rebuild docks
+        # Rebuild docks. call_tree_dock and call_graph_dock both aggregate
+        # the same spans into the same tree shape -- compute it once and
+        # share it (see the matching comment in _build_ui()).
+        shared_call_tree = build_call_tree(self.spans)
         self.summary_dock.set_spans(self.spans, self.color_map)
-        self.call_tree_dock.set_spans(self.spans, self.total_us, self.color_map)
-        self.call_graph_dock.set_spans(self.spans, self.color_map)
+        self.call_tree_dock.set_spans(self.spans, self.total_us, self.color_map, tree=shared_call_tree)
+        self.call_graph_dock.set_spans(self.spans, self.color_map, tree=shared_call_tree)
         self.marker_dock.set_marks(self.marks)
         self.marker_dock.set_unit(self.unit_label, self.unit_scale)
         self.top_n_dock.set_spans(self.spans, self.color_map)

@@ -43,30 +43,36 @@ ARROW_SIZE  = 8     # filled arrowhead half-width in px
 # Layout helpers
 # ═══════════════════════════════════════════════════════════════════════
 
-def _compute_width(node: dict) -> float:
+def _compute_width(node: dict, widths: dict) -> float:
     """Post-order: return the column-unit width of this subtree.
 
     Each node occupies at least 1 unit; an internal node occupies the sum
     of its children's widths (with 0.4-unit gaps between siblings).
+
+    ``widths`` (keyed by ``id(node)``) holds the result instead of writing
+    it onto ``node`` itself, so the aggregated call tree (which may be
+    shared with other docks, e.g. CallTreeDock, computed once from the
+    same spans) is never mutated by layout.
     """
     children = list(node["children"].values())
     if not children:
-        node["_width"] = 1.0
+        widths[id(node)] = 1.0
         return 1.0
-    total = sum(_compute_width(c) for c in children)
+    total = sum(_compute_width(c, widths) for c in children)
     # gaps between N children: (N-1) * 0.4
     total += (len(children) - 1) * 0.4
-    node["_width"] = total
+    widths[id(node)] = total
     return total
 
 
-def _assign_positions(node: dict, cx: float, row: int, positions: dict, path: str) -> None:
+def _assign_positions(node: dict, cx: float, row: int, positions: dict, path: str, widths: dict) -> None:
     """Pre-order: assign pixel (x, y) to every node.
 
     ``positions`` is filled with ``path → (px_x, px_y)`` where the coordinates
     are the *top-left* corner of the node box.  ``path`` is the parent-chain
     joined by '/' so identical function names at different call sites map to
-    separate entries.
+    separate entries. ``widths`` is the id(node)->width map _compute_width()
+    built for this same tree.
     """
     px_x = cx * STRIDE_X - NODE_W / 2
     px_y = row * STRIDE_Y
@@ -77,15 +83,15 @@ def _assign_positions(node: dict, cx: float, row: int, positions: dict, path: st
         return
 
     # Centre children under this node
-    total_child_width = sum(c.get("_width", 1.0) for c in children)
+    total_child_width = sum(widths.get(id(c), 1.0) for c in children)
     total_child_width += (len(children) - 1) * 0.4
 
     child_cx = cx - total_child_width / 2
     for child in children:
-        w = child.get("_width", 1.0)
+        w = widths.get(id(child), 1.0)
         child_cx += w / 2
         child_path = path + "/" + child["name"]
-        _assign_positions(child, child_cx, row + 1, positions, child_path)
+        _assign_positions(child, child_cx, row + 1, positions, child_path, widths)
         child_cx += w / 2 + 0.4
 
 
@@ -308,17 +314,19 @@ def _build_scene(tree: dict, color_map: dict,
         layer.set_data([], [], QtCore.QRectF(), unit_label, unit_scale)
         return scene, layer
 
-    # Compute layout widths
-    total_width = sum(_compute_width(r) for r in roots) + (len(roots) - 1) * 0.4
+    # Compute layout widths (kept in a side dict, not written onto the tree
+    # itself -- see _compute_width()'s docstring).
+    widths: dict = {}
+    total_width = sum(_compute_width(r, widths) for r in roots) + (len(roots) - 1) * 0.4
 
     # Assign positions — treat all top-level children as siblings under a
     # virtual root centred at 0.
     positions: dict[str, QtCore.QPointF] = {}
     cx = -total_width / 2
     for r in roots:
-        w = r.get("_width", 1.0)
+        w = widths.get(id(r), 1.0)
         cx += w / 2
-        _assign_positions(r, cx, 0, positions, r["name"])
+        _assign_positions(r, cx, 0, positions, r["name"], widths)
         cx += w / 2 + 0.4
 
     nodes = []
@@ -447,7 +455,7 @@ class CallGraphDock(DockBase):
 
     function_clicked = QtCore.Signal(str)
 
-    def __init__(self, spans, color_map, parent=None):
+    def __init__(self, spans, color_map, parent=None, tree=None):
         super().__init__("Call Graph", parent)
         self.setAllowedAreas(QtCore.Qt.DockWidgetArea.AllDockWidgetAreas)
 
@@ -486,16 +494,25 @@ class CallGraphDock(DockBase):
         fit_sc.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
         fit_sc.activated.connect(self._fit_view)
 
-        self.set_spans(spans, color_map)
+        self.set_spans(spans, color_map, tree=tree)
 
     # ── Public API ──────────────────────────────────────────────────
 
-    def set_spans(self, spans, color_map=None, _fit=True):
-        """Rebuild the graph from a new span list."""
+    def set_spans(self, spans, color_map=None, _fit=True, tree=None):
+        """Rebuild the graph from a new span list.
+
+        ``tree`` lets a caller that already computed build_call_tree(spans)
+        (e.g. ProfilerWindow, sharing it with CallTreeDock) pass it in
+        directly instead of this dock recomputing it. The tree is only
+        ever read here -- _build_scene()'s layout pass keeps its own
+        per-node width data in a side dict rather than writing onto the
+        tree, so it's safe to share the same tree object with other docks.
+        """
         self._spans = spans
         if color_map is not None:
             self._color_map = color_map
-        tree = build_call_tree(spans)
+        if tree is None:
+            tree = build_call_tree(spans)
         scene, layer = _build_scene(
             tree, self._color_map, self._unit_label, self._unit_scale
         )

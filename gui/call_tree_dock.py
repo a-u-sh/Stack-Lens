@@ -64,7 +64,7 @@ class CallTreeDock(DockBase):
 
     function_clicked = QtCore.Signal(str)
 
-    def __init__(self, spans, color_map, total_us, parent=None):
+    def __init__(self, spans, color_map, total_us, parent=None, tree=None):
         super().__init__("Call Tree", parent)
         self.setAllowedAreas(QtCore.Qt.DockWidgetArea.AllDockWidgetAreas)
 
@@ -105,12 +105,20 @@ class CallTreeDock(DockBase):
         self.setWidget(self._tree)
 
         self._apply_headers()
-        self.set_spans(spans, total_us)
+        self.set_spans(spans, total_us, tree=tree)
 
     # ── Public API ──────────────────────────────────────────────────
 
-    def set_spans(self, spans, total_us, color_map=None):
-        """Rebuild the tree from a new span list."""
+    def set_spans(self, spans, total_us, color_map=None, tree=None):
+        """Rebuild the tree from a new span list.
+
+        ``tree`` (the aggregated build_call_tree(spans) dict, not to be
+        confused with self._tree, the QTreeWidget) lets a caller that
+        already computed it -- e.g. ProfilerWindow, sharing it with
+        CallGraphDock -- pass it in directly instead of recomputing it
+        here. This dock only ever reads the tree, never mutates it, so
+        sharing the same object with other docks is safe.
+        """
         if color_map is not None:
             self._color_map = color_map
         self._total_us = max(total_us, 1e-9)
@@ -125,7 +133,7 @@ class CallTreeDock(DockBase):
         self._suppress_expand_resize = True
         try:
             self._tree.clear()
-            root = build_call_tree(spans)
+            root = tree if tree is not None else build_call_tree(spans)
 
             top_children = sorted(
                 root["children"].values(),
